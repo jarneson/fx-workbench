@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Bridge fx lifecycle events to tmux pane and window options."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+MAX_REQUEST_BYTES = 64 * 1024
+TMUX = os.environ.get("FX_WORKBENCH_TMUX_BIN", "tmux")
+
+
+def tmux(*args: str, capture: bool = False) -> str:
+    result = subprocess.run(
+        [TMUX, *args],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return result.stdout.strip() if capture else ""
+
+
+def pane_state(pane: str) -> str:
+    return tmux("show-options", "-p", "-v", "-t", pane, "@fx_state", capture=True)
+
+
+def refresh_window(pane: str) -> None:
+    window = tmux("display-message", "-p", "-t", pane, "#{window_id}", capture=True)
+    if not window:
+        return
+    states = []
+    panes = tmux("list-panes", "-t", window, "-F", "#{pane_id}", capture=True)
+    for window_pane in panes.splitlines():
+        state = pane_state(window_pane)
+        if state:
+            states.append(state)
+    state = ""
+    for candidate in ("needs-attention", "running", "idle"):
+        if candidate in states:
+            state = candidate
+            break
+    if state:
+        tmux("set-option", "-w", "-t", window, "@fx_window_state", state)
+    else:
+        tmux("set-option", "-w", "-u", "-t", window, "@fx_window_state")
+
+
+def set_state(pane: str, state: str) -> None:
+    previous = pane_state(pane)
+    tmux("set-option", "-p", "-t", pane, "@fx_state", state)
+    if previous != state:
+        tmux("set-option", "-p", "-t", pane, "@fx_state_changed_at_ms", str(int(time.time() * 1000)))
+    refresh_window(pane)
+    tmux("refresh-client", "-S")
+
+
+def clear(pane: str, force: bool = False) -> None:
+    state = pane_state(pane)
+    kind = tmux("show-options", "-p", "-v", "-t", pane, "@fx_attention_kind", capture=True)
+    if kind == "blocked" and state == "needs-attention" and not force:
+        return
+    window = tmux("display-message", "-p", "-t", pane, "#{window_id}", capture=True)
+    tmux("set-option", "-p", "-u", "-t", pane, "@fx_pane_attention")
+    tmux("set-option", "-p", "-u", "-t", pane, "@fx_attention_kind")
+    if state == "needs-attention":
+        set_state(pane, "idle")
+    else:
+        refresh_window(pane)
+    if window:
+        attention = tmux(
+            "list-panes",
+            "-t",
+            window,
+            "-F",
+            "#{@fx_pane_attention}",
+            capture=True,
+        )
+        if "1" not in attention.splitlines():
+            tmux("set-option", "-w", "-u", "-t", window, "@fx_window_attention")
+    tmux("refresh-client", "-S")
+
+
+def attention(pane: str, reason: str) -> None:
+    window = tmux("display-message", "-p", "-t", pane, "#{window_id}", capture=True)
+    kind = "done" if reason == "done" else "blocked"
+    tmux("set-option", "-p", "-t", pane, "@fx_pane_attention", "1")
+    tmux("set-option", "-p", "-t", pane, "@fx_attention_kind", kind)
+    if window:
+        tmux("set-option", "-w", "-t", window, "@fx_window_attention", "1")
+    set_state(pane, "needs-attention")
+
+
+def release(pane: str) -> None:
+    clear(pane, force=True)
+    for option in ("@fx_session_id", "@fx_state", "@fx_state_changed_at_ms"):
+        tmux("set-option", "-p", "-u", "-t", pane, option)
+    refresh_window(pane)
+
+
+def sync_session_metadata(pane: str, session_id: str, known_mtime: int | None) -> int | None:
+    metadata_file = Path.home() / ".fx" / "sessions" / session_id / "session.json"
+    try:
+        metadata_mtime = int(metadata_file.stat().st_mtime)
+        if metadata_mtime == known_mtime:
+            return known_mtime
+        metadata = json.loads(metadata_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return known_mtime
+    title = metadata.get("title")
+    if not isinstance(title, str) or not title:
+        title = "Untitled session"
+    title = title[:60]
+    updated_at_ms = metadata.get("updated_at_ms")
+    if not isinstance(updated_at_ms, int):
+        updated_at_ms = 0
+    tmux("set-option", "-p", "-t", pane, "@fx_session_title", title)
+    tmux("set-option", "-p", "-t", pane, "@fx_session_updated_at_ms", str(updated_at_ms))
+    tmux("set-option", "-p", "-t", pane, "@fx_session_metadata_mtime", str(metadata_mtime))
+    tmux("select-pane", "-t", pane, "-T", title)
+    tmux("rename-window", "-t", pane, f"fx: {title}")
+    return metadata_mtime
+
+
+def reply(connection: socket.socket, request_id: object) -> None:
+    try:
+        connection.sendall(json.dumps({"id": request_id, "result": {}}).encode() + b"\n")
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def serve(socket_path: str, expected_pane: str) -> int:
+    if not expected_pane.startswith("%"):
+        print("fx-tmux-statusd: invalid tmux pane", file=sys.stderr)
+        return 2
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+    os.chmod(socket_path, 0o600)
+    server.listen(8)
+    server.settimeout(0.25)
+    running = True
+    previous_state: str | None = None
+    session_id: str | None = None
+    metadata_mtime: int | None = None
+    next_metadata_check = 0.0
+
+    def stop(_signum: int, _frame: object) -> None:
+        nonlocal running
+        running = False
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
+    try:
+        while running:
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                if session_id and time.monotonic() >= next_metadata_check:
+                    metadata_mtime = sync_session_metadata(expected_pane, session_id, metadata_mtime)
+                    next_metadata_check = time.monotonic() + 1.0
+                continue
+            with connection:
+                request_bytes = b""
+                while len(request_bytes) < MAX_REQUEST_BYTES:
+                    chunk = connection.recv(min(4096, MAX_REQUEST_BYTES - len(request_bytes)))
+                    if not chunk or b"\n" in chunk:
+                        request_bytes += chunk
+                        break
+                    request_bytes += chunk
+                try:
+                    request = json.loads(request_bytes.split(b"\n", 1)[0])
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                reply(connection, request.get("id"))
+                params = request.get("params") or {}
+                if (params.get("pane_id") or params.get("target")) != expected_pane:
+                    continue
+                method = request.get("method")
+                if method == "pane.report_agent_session":
+                    reported = params.get("agent_session_id")
+                    if isinstance(reported, str) and reported:
+                        session_id = reported
+                        tmux("set-option", "-p", "-t", expected_pane, "@fx_session_id", reported)
+                        metadata_mtime = sync_session_metadata(expected_pane, reported, metadata_mtime)
+                elif method == "pane.report_agent":
+                    state = params.get("state")
+                    if state == "working":
+                        set_state(expected_pane, "running")
+                        clear(expected_pane)
+                    elif state == "blocked":
+                        attention(expected_pane, str(params.get("custom_status") or "blocked"))
+                    elif state == "idle":
+                        set_state(expected_pane, "idle")
+                        if previous_state in {"working", "blocked"}:
+                            attention(expected_pane, "done")
+                    if state in {"idle", "working", "blocked"}:
+                        previous_state = state
+                elif method == "pane.clear_agent_authority":
+                    release(expected_pane)
+                    running = False
+    finally:
+        release(expected_pane)
+        server.close()
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "clear":
+        if len(sys.argv) not in (3, 4):
+            print("usage: fx-tmux-statusd clear <pane> [--force]", file=sys.stderr)
+            return 2
+        clear(sys.argv[2], len(sys.argv) == 4 and sys.argv[3] == "--force")
+        return 0
+    if len(sys.argv) == 4 and sys.argv[1] == "serve":
+        return serve(sys.argv[2], sys.argv[3])
+    print("usage: fx-tmux-statusd serve <socket> <pane> | clear <pane> [--force]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

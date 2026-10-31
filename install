@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+gobin=${GOBIN:-"$HOME/.local/bin"}
+config_home=${FX_WORKBENCH_CONFIG_HOME:-${XDG_CONFIG_HOME:-"$HOME/.config"}}
+fx_root=${FX_WORKBENCH_FX_ROOT:-"$HOME/.fx"}
+tmux_config=${FX_WORKBENCH_TMUX_CONFIG:-"$config_home/fx-workbench/tmux.conf"}
+tuicr_config=${FX_WORKBENCH_TUICR_CONFIG:-"$config_home/tuicr/config.toml"}
+
+managed_files=(
+  fx-obs
+  fx-tmux
+  fx-tmux-statusd
+  fx-workbench-cleanup
+  fx-workbench-new-workstream
+  fx-workbench-planner
+  fx-workbench-projects
+  fx-workbench-review-pane
+)
+
+build_root=$(mktemp -d "${TMPDIR:-/tmp}/fx-workbench-install.XXXXXX")
+trap 'rm -rf "$build_root"' EXIT
+build_bin="$build_root/bin"
+mkdir -p "$build_bin"
+
+check_file() {
+  local source=$1 destination=$2
+  if [[ -e $destination && ! -f $destination ]]; then
+    echo "install: destination is not a regular file: $destination" >&2
+    return 1
+  fi
+  if [[ -f $destination ]] && ! cmp -s "$source" "$destination"; then
+    echo "install: refusing to overwrite existing file: $destination" >&2
+    echo "Move or remove that file, then run ./install again." >&2
+    return 1
+  fi
+}
+
+install_file() {
+  local source=$1 destination=$2 mode=$3
+  mkdir -p "$(dirname -- "$destination")"
+  if [[ -f $destination ]]; then
+    if [[ $mode == 0755 && ! -x $destination ]]; then
+      chmod "$mode" "$destination"
+      printf 'Fixed executable mode %s\n' "$destination"
+    else
+      printf 'Unchanged %s\n' "$destination"
+    fi
+    return
+  fi
+  install -m "$mode" "$source" "$destination"
+  printf 'Installed %s\n' "$destination"
+}
+
+cd "$root"
+GOBIN="$build_bin" go install ./cmd/fx-workbench ./cmd/fx-principle
+
+fx_preflight=(fx install --dry-run --target "$fx_root")
+fx_install=(fx install --target "$fx_root")
+if [[ ${FX_WORKBENCH_MIGRATE_FX:-0} == 1 ]]; then
+  fx_preflight+=(--migrate-legacy)
+  fx_install+=(--migrate-legacy)
+fi
+if ! "$build_bin/fx-workbench" "${fx_preflight[@]}" >"$build_root/fx-preflight.log" 2>&1; then
+  cat "$build_root/fx-preflight.log" >&2
+  exit 1
+fi
+
+check_file "$build_bin/fx-workbench" "$gobin/fx-workbench"
+check_file "$build_bin/fx-principle" "$gobin/fx-principle"
+for name in "${managed_files[@]}"; do
+  check_file "$root/scripts/$name" "$gobin/$name"
+done
+check_file "$root/config/tmux.conf" "$tmux_config"
+check_file "$root/config/tuicr/config.toml" "$tuicr_config"
+
+install_file "$build_bin/fx-workbench" "$gobin/fx-workbench" 0755
+install_file "$build_bin/fx-principle" "$gobin/fx-principle" 0755
+for name in "${managed_files[@]}"; do
+  install_file "$root/scripts/$name" "$gobin/$name" 0755
+done
+install_file "$root/config/tmux.conf" "$tmux_config" 0644
+install_file "$root/config/tuicr/config.toml" "$tuicr_config" 0644
+"$gobin/fx-workbench" "${fx_install[@]}"

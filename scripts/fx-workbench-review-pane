@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target_pane=${1:-}
+tmux_bin=${FX_WORKBENCH_TMUX_BIN:-tmux}
+workbench_bin=${FX_WORKBENCH_BIN:-"fx-workbench"}
+tuicr_bin=${FX_WORKBENCH_TUICR_BIN:-tuicr}
+
+fail() {
+  "$tmux_bin" display-message -t "${target_pane:-}" "Review unavailable: $*" 2>/dev/null || true
+  exit 1
+}
+
+[[ -n $target_pane ]] || fail 'missing target pane'
+
+task_id=$($tmux_bin display-message -p -t "$target_pane" '#{@fx_task_id}')
+[[ -n $task_id ]] || fail 'current pane is not a task agent'
+
+window_id=$($tmux_bin display-message -p -t "$target_pane" '#{window_id}')
+worktree=$($tmux_bin display-message -p -t "$target_pane" '#{pane_current_path}')
+[[ -n $window_id && -n $worktree ]] || fail 'could not resolve task window or worktree'
+
+review_pane=$(
+  "$tmux_bin" list-panes -t "$window_id" -F '#{pane_id}|#{@fx_task_review}|#{@fx_task_id}' |
+    awk -F'|' -v task="$task_id" '$2 == "1" && $3 == task { print $1; exit }'
+)
+if [[ -n $review_pane ]]; then
+  "$tmux_bin" select-pane -t "$review_pane" -T review
+  exit 0
+fi
+
+review_pane=$(
+  "$tmux_bin" split-window -b -h -l 60% -P -F '#{pane_id}' -t "$target_pane" -c "$worktree" \
+    "$workbench_bin" review-relay --target-pane "$target_pane" --task-id "$task_id" --tmux "$tmux_bin" -- \
+    "$tuicr_bin" --no-update-check
+)
+"$tmux_bin" set-option -p -t "$review_pane" @fx_task_review 1
+"$tmux_bin" set-option -p -t "$review_pane" @fx_task_id "$task_id"
+"$tmux_bin" select-pane -t "$review_pane" -T review

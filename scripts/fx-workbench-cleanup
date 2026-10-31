@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+workbench_bin=${FX_WORKBENCH_BIN:-"fx-workbench"}
+fzf_bin=${FX_WORKBENCH_FZF_BIN:-fzf}
+jq_bin=${FX_WORKBENCH_JQ_BIN:-jq}
+git_bin=${FX_WORKBENCH_GIT_BIN:-git}
+tmux_bin=${FX_WORKBENCH_TMUX_BIN:-tmux}
+script_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+
+delete_selected() {
+  local repository=$1
+  local branch=$2
+  local worktree=$3
+  local session_name session_id name session_worktree
+
+  "$git_bin" -C "$repository" worktree remove "$worktree" --force
+  "$git_bin" -C "$repository" branch -D -- "$branch"
+
+  session_name=$(basename "$worktree" | tr . _)
+  while IFS=$'\t' read -r session_id name session_worktree; do
+    [[ -n $session_id ]] || continue
+    if [[ $session_worktree == "$worktree" || $name == "$session_name" ]]; then
+      "$tmux_bin" kill-session -t "$session_id"
+    fi
+  done < <("$tmux_bin" list-sessions -F $'#{session_id}\t#{session_name}\t#{@fx_worktree}' 2>/dev/null || true)
+
+  printf 'Deleted branch and worktree: %s\n' "$branch"
+}
+
+if [[ ${1:-} == --delete ]]; then
+  [[ $# -eq 4 ]] || { printf 'usage: %s --delete <repository> <branch> <worktree>\n' "$0" >&2; exit 2; }
+  delete_selected "$2" "$3" "$4"
+  exit 0
+fi
+
+inventory=$(mktemp "${TMPDIR:-/tmp}/fx-workbench-cleanup.XXXXXX")
+worktrees=$(mktemp "${TMPDIR:-/tmp}/fx-workbench-cleanup.XXXXXX")
+rows=$(mktemp "${TMPDIR:-/tmp}/fx-workbench-cleanup.XXXXXX")
+trap 'rm -f "$inventory" "$worktrees" "$rows"' EXIT
+
+"$git_bin" worktree list --porcelain > "$inventory"
+awk '
+  function emit() {
+    if (path != "" && branch != "" && path != root) {
+      print branch "\t" path
+    }
+  }
+  /^worktree / {
+    emit()
+    path = substr($0, 10)
+    if (root == "") root = path
+    branch = ""
+    next
+  }
+  /^branch refs\/heads\// {
+    branch = substr($0, 19)
+    next
+  }
+  END { emit() }
+' "$inventory" > "$worktrees"
+
+if [[ ! -s $worktrees ]]; then
+  printf 'No branch worktrees found.\n'
+  exit 0
+fi
+
+repository=$(awk '/^worktree / { print substr($0, 10); exit }' "$inventory")
+tasks='[]'
+if task_output=$("$workbench_bin" list --type task --all --json 2>/dev/null); then
+  tasks=$task_output
+fi
+
+"$jq_bin" -Rr --argjson tasks "$tasks" --arg repository "$repository" '
+  split("\t") as $row |
+  ($tasks | map(select(.branch == $row[0] and .repository == $repository)) | first) as $task |
+  [($task.status // "-"), ($task.id // "-"), $row[0], $row[1]] | @tsv
+' "$worktrees" > "$rows"
+
+selection=$(
+  "$fzf_bin" \
+    --delimiter=$'\t' \
+    --with-nth=1,3,2,4 \
+    --no-multi \
+    --layout=reverse \
+    --border=rounded \
+    --prompt='delete branch > ' \
+    --header='Enter: delete branch + worktree + tmux session  ·  Esc: cancel' \
+    < "$rows"
+) || exit 0
+
+IFS=$'\t' read -r task_status task_id branch worktree <<< "$selection"
+printf 'Selected %s\n' "$branch"
+if [[ $task_id != - ]]; then
+  printf 'Task: %s [%s]\n' "$task_id" "$task_status"
+fi
+
+if [[ -n ${TMUX:-} ]]; then
+  printf -v delete_command 'FX_WORKBENCH_GIT_BIN=%q FX_WORKBENCH_TMUX_BIN=%q %q --delete %q %q %q' \
+    "$git_bin" "$tmux_bin" "$script_path" "$repository" "$branch" "$worktree"
+  printf -v success_message '%q' "Deleted branch and worktree: $branch"
+  printf -v failure_message '%q' "Branch cleanup failed: $branch"
+  printf -v tmux_command '%q' "$tmux_bin"
+  background_command="$delete_command; rc=\$?; if [ \$rc -eq 0 ]; then $tmux_command display-message $success_message; else $tmux_command display-message $failure_message; fi; exit \$rc"
+  "$tmux_bin" run-shell -b "$background_command"
+  printf 'Deletion queued in the background.\n'
+  exit 0
+fi
+
+delete_selected "$repository" "$branch" "$worktree"

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fx_bin=${FX_BIN:-fx}
+statusd_bin=${FX_TMUX_STATUSD_BIN:-"$script_dir/fx-tmux-statusd"}
+
+if [[ -z ${TMUX_PANE:-} ]]; then
+  exec "$fx_bin" "$@"
+fi
+
+socket_dir=${TMPDIR:-/tmp}
+socket="$socket_dir/fx-tmux-status-${TMUX_PANE#%}-$$.sock"
+log_dir=${FX_TMUX_LOG_DIR:-"$HOME/.fx/logs"}
+mkdir -p "$log_dir"
+
+"$statusd_bin" serve "$socket" "$TMUX_PANE" 2>>"$log_dir/tmux-status.log" &
+statusd_pid=$!
+cleanup() {
+  kill "$statusd_pid" 2>/dev/null || true
+  wait "$statusd_pid" 2>/dev/null || true
+  rm -f "$socket"
+}
+trap cleanup EXIT INT TERM HUP
+
+for _ in {1..100}; do
+  [[ -S $socket ]] && break
+  kill -0 "$statusd_pid" 2>/dev/null || {
+    echo "fx-tmux: lifecycle bridge failed to start; see $log_dir/tmux-status.log" >&2
+    exit 1
+  }
+  sleep 0.01
+done
+[[ -S $socket ]] || { echo 'fx-tmux: lifecycle bridge did not become ready' >&2; exit 1; }
+
+HERDR_SOCKET_PATH="$socket" HERDR_PANE_ID="$TMUX_PANE" "$fx_bin" "$@"

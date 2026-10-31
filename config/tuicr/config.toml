@@ -1,0 +1,8 @@
+# Keep diff lines within the horizontal viewport instead of wrapping.
+wrap = false
+
+# Start reviews focused on one file at a time.
+single_file_view = true
+
+# Remove reviewed files from the queue so marking one advances to the next.
+show_reviewed = false

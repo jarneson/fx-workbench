@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+workbench_bin=${FX_WORKBENCH_BIN:-"fx-workbench"}
+obs_bin=${FX_OBS_BIN:-"fx-obs"}
+fzf_bin=${FX_WORKBENCH_FZF_BIN:-fzf}
+jq_bin=${FX_WORKBENCH_JQ_BIN:-jq}
+tmux_bin=${FX_WORKBENCH_TMUX_BIN:-tmux}
+fx_bin=${FX_BIN:-fx}
+recency_file=${FX_WORKBENCH_RECENCY_FILE:-"$HOME/.fx/workbench-recency.json"}
+
+pause_on_error() {
+  local message=$1
+  printf '%s\n\nPress enter or escape to close' "$message" >&2
+  IFS= read -r -s -n 1 _ || true
+  printf '\n' >&2
+  exit 1
+}
+
+projects=$($workbench_bin list --type project --json 2>&1) || pause_on_error "$projects"
+if [[ $($jq_bin 'length' <<< "$projects") -eq 0 ]]; then
+  pause_on_error 'No active projects found.'
+fi
+workstreams=$($workbench_bin list --type workstream --all-projects --json)
+fx_sessions=$($fx_bin sessions --all --limit 100 --json 2>/dev/null || printf '{"sessions":[]}')
+
+session_rows=$("$tmux_bin" list-sessions -F '#{@fx_project_id}|#{@fx_repository}|#{session_activity}' 2>/dev/null || true)
+sessions=$($jq_bin -Rn '
+  [inputs
+    | select(length > 0)
+    | split("|")
+    | {project: .[0], repository: .[1], activity: ((.[2] | tonumber? // 0) * 1000)}]
+' <<< "$session_rows")
+recency='{}'
+if [[ -f $recency_file ]] && "$jq_bin" -e 'type == "object"' "$recency_file" >/dev/null 2>&1; then
+  recency=$(cat "$recency_file")
+fi
+projects=$($jq_bin --argjson sessions "$sessions" --argjson workstreams "$workstreams" --argjson fx_sessions "$fx_sessions" --argjson recency "$recency" '
+  map(. as $project |
+    ($sessions
+      | map(select(
+          (.project != "" and .project == $project.id) or
+          (.repository != "" and .repository == ($project.root_repository // ""))
+        ))
+      | map(.activity)
+      | max // 0
+    ) as $runtime_activity
+    | ($workstreams
+      | map(select(.project == $project.id))
+      | map(. as $workstream |
+          ($fx_sessions.sessions // []
+            | map(select(.id == ($workstream.planner_session_id // "")))
+            | map(.updated_at_ms)
+            | max // 0
+          ) as $session_activity
+          | (((($workstream.updated // "") | fromdateiso8601? // 0) * 1000)) as $metadata_activity
+          | [$session_activity, $metadata_activity] | max
+        )
+      | max // 0
+    ) as $workstream_activity
+    | ($recency.projects[$project.id] // 0) as $selected_activity
+    | $project + {_session_activity: ([$runtime_activity, $workstream_activity, $selected_activity] | max)}
+  )
+  | sort_by(-._session_activity, (.title // .id), .id)
+' <<< "$projects")
+
+selection=$(
+  $jq_bin -r '.[] | [
+    .id,
+    (.title // .id),
+    (.root_repository // (.repositories[0] // ""))
+  ] | @tsv' <<< "$projects" |
+    "$fzf_bin" \
+      --delimiter=$'\t' \
+      --with-nth=2,1,3 \
+      --no-multi \
+      --layout=reverse \
+      --border=rounded \
+      --prompt='open project > ' \
+      --header='Enter: open/focus project session  ·  Esc: cancel'
+) || exit 0
+
+IFS=$'\t' read -r project _ repository <<< "$selection"
+[[ -n $repository ]] || pause_on_error "Project $project has no root repository."
+[[ -d $repository ]] || pause_on_error "Project $project root repository does not exist: $repository"
+
+"$obs_bin" set "$project" >/dev/null
+root_output=$($workbench_bin root --repository "$repository" 2>&1) || pause_on_error "$root_output"
+session=$(awk -F': ' '/^root session:/ { print $2; exit }' <<< "$root_output")
+[[ -n $session ]] || pause_on_error "Could not resolve the tmux session for $project."
+"$tmux_bin" set-option -t "$session" @fx_project_id "$project"
+recency_dir=$(dirname "$recency_file")
+mkdir -p "$recency_dir"
+recency_tmp=$(mktemp "$recency_dir/workbench-recency.XXXXXX")
+"$jq_bin" --arg project "$project" --argjson now "$(($(date +%s) * 1000))" '.projects[$project] = $now' <<< "$recency" > "$recency_tmp"
+mv "$recency_tmp" "$recency_file"
+
+switch_args=(switch-client)
+client=${FX_WORKBENCH_CLIENT:-}
+if [[ -n $client && $client != *'#{'* ]]; then
+  switch_args+=(-c "$client")
+fi
+switch_args+=(-t "$session")
+"$tmux_bin" "${switch_args[@]}"

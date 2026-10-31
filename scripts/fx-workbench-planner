@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+workbench_bin=${FX_WORKBENCH_BIN:-"fx-workbench"}
+obs_bin=${FX_OBS_BIN:-"fx-obs"}
+fzf_bin=${FX_WORKBENCH_FZF_BIN:-fzf}
+jq_bin=${FX_WORKBENCH_JQ_BIN:-jq}
+tmux_bin=${FX_WORKBENCH_TMUX_BIN:-tmux}
+fx_bin=${FX_BIN:-fx}
+recency_file=${FX_WORKBENCH_RECENCY_FILE:-"$HOME/.fx/workbench-recency.json"}
+
+workstreams=$($workbench_bin list --type workstream --all-projects --json)
+count=$($jq_bin 'length' <<< "$workstreams")
+if [[ $count -eq 0 ]]; then
+  printf 'No active workstreams found.\n\nPress enter to close'
+  read -r _
+  exit 0
+fi
+
+session_rows=$("$tmux_bin" list-sessions -F '#{@fx_project_id}|#{@fx_workstream_id}|#{session_activity}' 2>/dev/null || true)
+window_rows=$("$tmux_bin" list-windows -a -F '#{@fx_planner_project}|#{@fx_planner_workstream}|#{window_activity}' 2>/dev/null || true)
+activities=$($jq_bin -Rn '
+  [inputs
+    | select(length > 0)
+    | split("|")
+    | select(.[0] != "" and .[1] != "")
+    | {project: .[0], workstream: .[1], activity: ((.[2] | tonumber? // 0) * 1000)}]
+' <<< "$session_rows"$'\n'"$window_rows")
+fx_sessions=$($fx_bin sessions --all --limit 100 --json 2>/dev/null || printf '{"sessions":[]}')
+recency='{}'
+if [[ -f $recency_file ]] && "$jq_bin" -e 'type == "object"' "$recency_file" >/dev/null 2>&1; then
+  recency=$(cat "$recency_file")
+fi
+workstreams=$($jq_bin --argjson activities "$activities" --argjson fx_sessions "$fx_sessions" --argjson recency "$recency" '
+  map(. as $workstream |
+    ($activities
+      | map(select(.project == $workstream.project and .workstream == $workstream.id))
+      | map(.activity)
+      | max // 0
+    ) as $runtime_activity
+    | ($fx_sessions.sessions // []
+      | map(select(.id == ($workstream.planner_session_id // "")))
+      | map(.updated_at_ms)
+      | max // 0
+    ) as $session_activity
+    | (((($workstream.updated // "") | fromdateiso8601? // 0) * 1000)) as $metadata_activity
+    | ($recency.workstreams[$workstream.project + "/" + $workstream.id] // 0) as $selected_activity
+    | $workstream + {_runtime_activity: ([$runtime_activity, $session_activity, $metadata_activity, $selected_activity] | max)}
+  )
+  | sort_by(
+      -._runtime_activity,
+      .project,
+      (if (.order // 0) > 0 then .order else 999999 end),
+      (.title // .id),
+      .id
+    )
+' <<< "$workstreams")
+
+selection=$(
+  $jq_bin -r '.[] | [
+    .project,
+    .id,
+    (.title // .id),
+    (.repository // ""),
+    (if (.planner_session_id // "") == "" then "new" else "resume" end)
+  ] | @tsv' <<< "$workstreams" |
+    "$fzf_bin" \
+      --delimiter=$'\t' \
+      --with-nth=1,3,2,5,4 \
+      --no-multi \
+      --layout=reverse \
+      --border=rounded \
+      --prompt='plan workstream > ' \
+      --header='Enter: open/focus  ·  Esc: cancel'
+) || exit 0
+
+IFS=$'\t' read -r project workstream _ <<< "$selection"
+recency_dir=$(dirname "$recency_file")
+mkdir -p "$recency_dir"
+recency_tmp=$(mktemp "$recency_dir/workbench-recency.XXXXXX")
+"$jq_bin" --arg project "$project" --arg workstream "$project/$workstream" --argjson now "$(($(date +%s) * 1000))" '.projects[$project] = $now | .workstreams[$workstream] = $now' <<< "$recency" > "$recency_tmp"
+mv "$recency_tmp" "$recency_file"
+"$obs_bin" set "$project" >/dev/null
+if [[ -n ${TMUX:-} ]]; then
+  exec "$workbench_bin" plan --project "$project" --workstream "$workstream"
+fi
+
+plan_output=$($workbench_bin plan --project "$project" --workstream "$workstream")
+session=$(awk -F': ' '/^session target:/ { print $2; exit }' <<< "$plan_output")
+[[ -n $session ]] || {
+  printf 'Could not resolve workstream tmux session.\n%s\n' "$plan_output" >&2
+  exit 1
+}
+exec "$tmux_bin" attach-session -t "$session"

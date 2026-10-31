@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+workbench_bin=${FX_WORKBENCH_BIN:-"fx-workbench"}
+fzf_bin=${FX_WORKBENCH_FZF_BIN:-fzf}
+jq_bin=${FX_WORKBENCH_JQ_BIN:-jq}
+
+trap 'printf "\n" >&2; exit 0' INT TERM HUP
+
+read_value() {
+  local prompt=$1
+  local value=
+  local character=
+
+  printf '%s' "$prompt" >&2
+  while true; do
+    character=
+    if ! IFS= read -r -s -n 1 character; then
+      printf '\n' >&2
+      return 130
+    fi
+    case "$character" in
+      '')
+        printf '\n' >&2
+        printf '%s' "$value"
+        return 0
+        ;;
+      $'\e')
+        printf '\n' >&2
+        return 130
+        ;;
+      $'\177' | $'\b')
+        if [[ -n $value ]]; then
+          value=${value%?}
+          printf '\b \b' >&2
+        fi
+        ;;
+      $'\025')
+        while [[ -n $value ]]; do
+          value=${value%?}
+          printf '\b \b' >&2
+        done
+        ;;
+      *)
+        value+=$character
+        printf '%s' "$character" >&2
+        ;;
+    esac
+  done
+}
+
+pause_on_error() {
+  local message=$1
+  local character=
+  printf '\n%s\n\nPress enter or escape to close' "$message" >&2
+  while IFS= read -r -s -n 1 character; do
+    [[ -z $character || $character == $'\e' ]] && break
+  done
+  printf '\n' >&2
+  exit 1
+}
+
+resolution=$($workbench_bin project resolve --json 2>&1) || pause_on_error "$resolution"
+project=$($jq_bin -r '.project.id' <<< "$resolution")
+current_repository=$($jq_bin -r '.workspace_root // ""' <<< "$resolution")
+
+repositories=$($jq_bin -r --arg current "$current_repository" '
+  reduce ((.project.repositories // []) + [(.project.root_repository // "")])[] as $repository
+    ([]; if $repository == "" or index($repository) then . else . + [$repository] end)
+  | if $current != "" and index($current) then
+      [$current] + [.[] | select(. != $current)]
+    else
+      .
+    end
+  | .[]
+' <<< "$resolution")
+repository_count=$(grep -c . <<< "$repositories" || true)
+
+if [[ $repository_count -eq 0 ]]; then
+  pause_on_error "Project $project has no registered repositories."
+elif [[ $repository_count -eq 1 ]]; then
+  repository=$repositories
+else
+  repository=$(printf '%s\n' "$repositories" | "$fzf_bin" \
+    --no-multi \
+    --layout=reverse \
+    --border=rounded \
+    --prompt='workstream repository > ' \
+    --header="project: $project  ·  Enter: select  ·  Esc: cancel") || exit 0
+fi
+
+printf 'Project:    %s\nRepository: %s\n\n' "$project" "$repository"
+title=$(read_value 'Workstream title: ') || exit 0
+[[ -n $title ]] || exit 0
+
+default_id=$(printf '%s' "$title" \
+  | tr '[:upper:]' '[:lower:]' \
+  | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+[[ -n $default_id ]] || pause_on_error 'Could not derive a workstream ID from that title.'
+
+workstream_id=$(read_value "Workstream ID [$default_id]: ") || exit 0
+workstream_id=${workstream_id:-$default_id}
+
+printf '\nCreating %s/%s…\n' "$project" "$workstream_id"
+create_output=$($workbench_bin scaffold workstream \
+  --project "$project" \
+  --id "$workstream_id" \
+  --title "$title" \
+  --repository "$repository" \
+  --status active 2>&1) || pause_on_error "$create_output"
+printf '%s\n\nOpening planner…\n' "$create_output"
+
+plan_output=$($workbench_bin plan --project "$project" --workstream "$workstream_id" 2>&1) || pause_on_error "$plan_output"
+printf '%s\n' "$plan_output"

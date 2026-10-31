@@ -1,0 +1,9 @@
+# Go build and test output
+/bin/
+*.test
+*.out
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/

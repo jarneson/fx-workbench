@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+vault=${OBSIDIAN_VAULT:-"$HOME/Obsidian"}
+projects_dir="$vault/Projects"
+state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
+state_dir="$state_home/fx-workbench/obsidian-project"
+scope=${FX_OBS_SCOPE:-${TMUX_PANE:-default}}
+scope=${scope//[^[:alnum:]_.-]/_}
+state_file="$state_dir/$scope.txt"
+default_state_file="$state_dir/default.txt"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  fx-obs projects        List projects
+  fx-obs current         Print the selected project (pane override, then default)
+  fx-obs set <project>   Select a project for this pane and as the default
+  fx-obs vault           Print the configured Obsidian vault path
+  fx-obs project-path    Print the selected project path
+  fx-obs path            Print the selected project path
+USAGE
+}
+
+current_project() {
+  local file
+  for file in "$state_file" "$default_state_file"; do
+    if [[ -r $file ]]; then
+      cat "$file"
+      return
+    fi
+  done
+}
+
+selected_project_path() {
+  local project
+  project=$(current_project)
+  if [[ -z $project ]]; then
+    echo "fx-obs: no project selected; run 'fx-obs projects' then 'fx-obs set <project>'" >&2
+    exit 2
+  fi
+  printf '%s/%s\n' "$projects_dir" "$project"
+}
+
+command=${1:-current}
+case "$command" in
+  projects)
+    [[ -d $projects_dir ]] || { echo "fx-obs: projects directory does not exist: $projects_dir" >&2; exit 1; }
+    find "$projects_dir" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort
+    ;;
+  current)
+    project=$(current_project)
+    printf '%s\n' "${project:-(unset)}"
+    ;;
+  set)
+    project=${2:-}
+    if [[ -z $project || $project == '.' || $project == '..' || $project == */* ]]; then
+      echo 'fx-obs: project must be one non-empty directory name' >&2
+      exit 2
+    fi
+    project_dir="$projects_dir/$project"
+    if [[ ! -d $project_dir ]]; then
+      echo "fx-obs: project does not exist: $project" >&2
+      echo "Create it explicitly or choose one from 'fx-obs projects'." >&2
+      exit 2
+    fi
+    mkdir -p "$state_dir"
+    printf '%s' "$project" > "$state_file"
+    printf '%s' "$project" > "$default_state_file"
+    echo "fx-obs: project set to '$project' for scope '$scope' and as default"
+    echo "fx-obs: workloads live under $project_dir"
+    ;;
+  vault) printf '%s\n' "$vault" ;;
+  project-path|path) selected_project_path ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
