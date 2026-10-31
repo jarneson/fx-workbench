@@ -758,7 +758,7 @@ func TestTaskReviewScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	runTaskUIGit(t, directory, "add", "task.txt")
-	runTaskUIGit(t, directory, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+	runTaskUIGit(t, directory, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "base")
 	base := strings.TrimSpace(runTaskUIGit(t, directory, "rev-parse", "HEAD"))
 
 	if _, err := taskReviewScope(context.Background(), directory, "git"); err == nil || !strings.Contains(err.Error(), "no committed or working-tree changes") {
@@ -781,7 +781,7 @@ func TestTaskReviewScope(t *testing.T) {
 		}
 	}
 	runTaskUIGit(t, directory, "add", ".")
-	runTaskUIGit(t, directory, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "task")
+	runTaskUIGit(t, directory, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "task")
 	if changed := strings.Fields(runTaskUIGit(t, directory, "diff", "--name-only", base+"..HEAD")); len(changed) != 8 {
 		t.Fatalf("committed files = %v, want 8", changed)
 	}

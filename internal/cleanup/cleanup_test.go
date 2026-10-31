@@ -243,7 +243,7 @@ exit 1
 
 func runGit(t *testing.T, directory string, args ...string) {
 	t.Helper()
-	arguments := append([]string{"-C", directory}, args...)
+	arguments := append([]string{"-c", "commit.gpgsign=false", "-C", directory}, args...)
 	if output, err := exec.Command("git", arguments...).CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, output)
 	}
